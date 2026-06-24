@@ -2,67 +2,180 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"flag"
+	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/schollz/progressbar/v3"
+	"github.com/urfave/cli/v2"
+)
+
+const (
+	maxProxyChecks  = 5
+	proxyFormatHelp = "добавьте прокси в одном из форматов: IP:PORT, IP:PORT:USER:PASS или USER:PASS@IP:PORT"
 )
 
 var (
-	logMutex    sync.Mutex
-	success     int64
-	failed      int64
-	verboseMode bool
-	logFile     *os.File
+	success int64
+	failed  int64
 )
 
-func safeLog(format string, v ...interface{}) {
-	logMutex.Lock()
-	defer logMutex.Unlock()
-	msg := fmt.Sprintf(format+"\n", v...)
-	fmt.Print(msg)
-	if logFile != nil {
-		logFile.WriteString(msg)
+func normalizeProxy(raw string) (string, error) {
+	proxy := strings.TrimSpace(raw)
+	if proxy == "" {
+		return "", nil
 	}
+
+	if strings.Contains(proxy, "://") {
+		parsed, err := url.Parse(proxy)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return "", fmt.Errorf(proxyFormatHelp)
+		}
+		return proxy, nil
+	}
+
+	if strings.Contains(proxy, "@") {
+		credentials, address, ok := strings.Cut(proxy, "@")
+		if !ok || !hasTwoNonEmptyParts(credentials, ":") || !hasTwoNonEmptyParts(address, ":") {
+			return "", fmt.Errorf(proxyFormatHelp)
+		}
+		return "socks5://" + proxy, nil
+	}
+
+	parts := strings.Split(proxy, ":")
+	switch len(parts) {
+	case 2:
+		if hasOnlyNonEmptyParts(parts) {
+			return "socks5://" + proxy, nil
+		}
+	case 4:
+		if hasOnlyNonEmptyParts(parts) {
+			ip, port, user, password := parts[0], parts[1], parts[2], parts[3]
+			return fmt.Sprintf("socks5://%s:%s@%s:%s", user, password, ip, port), nil
+		}
+	}
+
+	return "", fmt.Errorf(proxyFormatHelp)
 }
 
-func logWorkerOutput(workerId int, output []byte, success bool) {
-	if !verboseMode || len(bytes.TrimSpace(output)) == 0 {
-		return
-	}
-	
-	logMutex.Lock()
-	defer logMutex.Unlock()
-	
-	msg := fmt.Sprintf("\n=== W%d OUTPUT ===\n%s=================\n", workerId, string(output))
-	fmt.Print(msg)
-	if logFile != nil {
-		logFile.WriteString(msg)
-	}
+func hasTwoNonEmptyParts(value string, separator string) bool {
+	parts := strings.Split(value, separator)
+	return len(parts) == 2 && hasOnlyNonEmptyParts(parts)
 }
 
-func normalizeProxy(p string) string {
-	p = strings.TrimSpace(p)
-	if p == "" {
-		return ""
+func hasOnlyNonEmptyParts(parts []string) bool {
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			return false
+		}
 	}
-	if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "socks5://") {
-		return "http://" + p
-	}
-	return p
+	return true
 }
 
-func testProxySpeed(rawProxy string) (float64, error) {
-	proxyURL := normalizeProxy(rawProxy)
+func readProxies(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var proxies []string
+	sc := bufio.NewScanner(file)
+	lineNumber := 0
+	for sc.Scan() {
+		lineNumber++
+		line, err := normalizeProxy(sc.Text())
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", lineNumber, err)
+		}
+		if line != "" {
+			proxies = append(proxies, line)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if len(proxies) == 0 {
+		return nil, fmt.Errorf("proxy file is empty")
+	}
+
+	return proxies, nil
+}
+
+func readLinks(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var links []string
+	sc := bufio.NewScanner(file)
+	for sc.Scan() {
+		if line := strings.TrimSpace(sc.Text()); line != "" {
+			links = append(links, line)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if len(links) == 0 {
+		return nil, fmt.Errorf("links file is empty")
+	}
+
+	return links, nil
+}
+
+func selectProxySampleIndexes(total int, maxChecks int, rng *rand.Rand) []int {
+	if total <= 0 || maxChecks <= 0 {
+		return nil
+	}
+
+	checks := maxChecks
+	if total < checks {
+		checks = total
+	}
+
+	perm := rng.Perm(total)
+	return perm[:checks]
+}
+
+func validateProxies(ctx context.Context, proxies []string) (float64, error) {
+	indexes := selectProxySampleIndexes(len(proxies), maxProxyChecks, rand.New(rand.NewSource(time.Now().UnixNano())))
+	if len(indexes) == 0 {
+		return 0, fmt.Errorf("proxy list is empty")
+	}
+
+	var firstSpeed float64
+	for i, index := range indexes {
+		speed, err := testProxySpeed(ctx, proxies[index])
+		if err != nil {
+			return 0, fmt.Errorf("proxy #%d failed validation: %w", index+1, err)
+		}
+		if i == 0 {
+			firstSpeed = speed
+		}
+	}
+
+	return firstSpeed, nil
+}
+
+func testProxySpeed(ctx context.Context, rawProxy string) (float64, error) {
+	proxyURL, err := normalizeProxy(rawProxy)
+	if err != nil {
+		return 0, err
+	}
 	parsedURL, err := url.Parse(proxyURL)
 	if err != nil {
 		return 0, err
@@ -79,7 +192,12 @@ func testProxySpeed(rawProxy string) (float64, error) {
 	testFile := "https://proof.ovh.net/files/1Mb.dat"
 
 	start := time.Now()
-	resp, err := client.Get(testFile)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, testFile, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -115,18 +233,21 @@ func calculateWorkers(speedMBps float64, videoSizeMB float64) int {
 	return w
 }
 
-func worker(id int, urls <-chan string, proxies []string, idx *int32, delay time.Duration, outDir string, wg *sync.WaitGroup) {
+func worker(ctx context.Context, id int, urls <-chan string, proxies []string, idx *int32, delay time.Duration, outDir string, wg *sync.WaitGroup, bar *progressbar.ProgressBar) {
 	defer wg.Done()
 
 	for urlLink := range urls {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		i := atomic.AddInt32(idx, 1)
-		proxy := normalizeProxy(proxies[int(i)%len(proxies)])
+		proxy := proxies[int(i)%len(proxies)]
 
-		safeLog("🔹 W%d | %s", id, proxy)
-
-		var stdoutBuf, stderrBuf bytes.Buffer
-		
-		cmd := exec.Command("yt-dlp",
+		cmd := exec.CommandContext(ctx, "yt-dlp",
+			"--quiet",
 			"-f", "bestvideo*+bestaudio/best",
 			"--merge-output-format", "mp4",
 			"-o", filepath.Join(outDir, "%(id)s.%(ext)s"),
@@ -140,26 +261,18 @@ func worker(id int, urls <-chan string, proxies []string, idx *int32, delay time
 			"--no-check-certificates",
 			urlLink,
 		)
-		
-		// Захватываем вывод в буфер вместо прямого вывода в консоль
-		cmd.Stdout = &stdoutBuf
-		cmd.Stderr = &stderrBuf
+		configureCommand(cmd)
 
-		start := time.Now()
-		err := cmd.Run()
-		
-		// Логируем вывод только если есть ошибка или включен verbose режим
-		if err != nil {
-			logWorkerOutput(id, stderrBuf.Bytes(), false)
-		}
-		
-		if err != nil {
+		cmd.Stdout = io.Discard
+		cmd.Stderr = io.Discard
+
+		if err := cmd.Run(); err != nil {
 			atomic.AddInt64(&failed, 1)
-			safeLog("❌ W%d | %.1fs", id, time.Since(start).Seconds())
 		} else {
 			atomic.AddInt64(&success, 1)
-			safeLog("✅ W%d | %.1fs", id, time.Since(start).Seconds())
 		}
+
+		_ = bar.Add(1)
 
 		if delay > 0 {
 			time.Sleep(delay)
@@ -167,96 +280,137 @@ func worker(id int, urls <-chan string, proxies []string, idx *int32, delay time
 	}
 }
 
-func main() {
-	fileLinks := flag.String("f", "links.txt", "Файл со ссылками")
-	fileProxy := flag.String("p", "proxies.txt", "Файл с прокси")
-	videoSize := flag.Float64("size", 15.0, "Примерный размер видео в МБ")
-	workers := flag.Int("w", 0, "Кол-во воркеров (0 = авто-расчёт)")
-	delay := flag.Duration("d", 500*time.Millisecond, "Мин. задержка")
-	outDir := flag.String("o", "downloads", "Папка для скачивания")
-	logPath := flag.String("log", "", "Путь к файлу лога (по умолчанию только консоль)")
-	verbose := flag.Bool("v", false, "Подробный вывод (логи yt-dlp для каждого видео)")
-	flag.Parse()
+func runDownloader(c *cli.Context) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	verboseMode = *verbose
-
-	// Открываем файл лога если указан
-	if *logPath != "" {
-		var err error
-		logFile, err = os.OpenFile(*logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			fmt.Printf("❌ Не удалось открыть лог-файл: %v\n", err)
-			os.Exit(1)
-		}
-		defer logFile.Close()
-		safeLog("📝 Логи пишутся в файл: %s", *logPath)
-	}
-
-	// Читаем прокси
-	pf, err := os.Open(*fileProxy)
-	if err != nil {
-		fmt.Printf("❌ Прокси: %v\n", err)
-		os.Exit(1)
-	}
-	var proxies []string
-	sc := bufio.NewScanner(pf)
-	for sc.Scan() {
-		if line := strings.TrimSpace(sc.Text()); line != "" {
-			proxies = append(proxies, line)
-		}
-	}
-	pf.Close()
-	if len(proxies) == 0 {
-		fmt.Println("❌ Прокси пусты")
-		os.Exit(1)
-	}
-
-	// Тест скорости (только если не задан -w вручную)
-	recommendedWorkers := *workers
-	if *workers == 0 {
-		fmt.Println("🧪 Тестирую скорость через первый прокси...")
-		speed, err := testProxySpeed(proxies[0])
-		if err != nil {
-			fmt.Printf("⚠️ Тест не прошёл (%v). Ставлю 1 воркер.\n", err)
-			recommendedWorkers = 1
-		} else {
-			fmt.Printf("✅ Скорость: %.2f МБ/с\n", speed)
-			recommendedWorkers = calculateWorkers(speed, *videoSize)
-			fmt.Printf("🔧 Авто-расчёт: %d воркеров (видео ~%.1f МБ)\n", recommendedWorkers, *videoSize)
-		}
-	} else {
-		fmt.Printf("⚙️ Ручной режим: %d воркеров (тест скорости пропущен)\n", *workers)
-	}
-
-	// Читаем ссылки
-	uf, err := os.Open(*fileLinks)
-	if err != nil {
-		fmt.Printf("❌ Ссылки: %v\n", err)
-		os.Exit(1)
-	}
-	urls := make(chan string, recommendedWorkers)
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
 	go func() {
-		defer close(urls)
-		sc := bufio.NewScanner(uf)
-		for sc.Scan() {
-			if line := strings.TrimSpace(sc.Text()); line != "" {
-				urls <- line
-			}
-		}
-		uf.Close()
+		<-interrupts
+		cancel()
 	}()
 
-	os.MkdirAll(*outDir, 0755)
+	atomic.StoreInt64(&success, 0)
+	atomic.StoreInt64(&failed, 0)
+
+	links, err := readLinks(c.String("links"))
+	if err != nil {
+		return fmt.Errorf("links: %w", err)
+	}
+
+	proxies, err := readProxies(c.String("proxies"))
+	if err != nil {
+		return fmt.Errorf("proxies: %w", err)
+	}
+
+	fmt.Printf("🧪 Проверяю прокси: до %d случайных из %d...\n", maxProxyChecks, len(proxies))
+	proxySpeed, err := validateProxies(ctx, proxies)
+	if err != nil {
+		return fmt.Errorf("прокси не рабочие: %w", err)
+	}
+	fmt.Printf("✅ Прокси прошли проверку. Скорость: %.2f МБ/с\n", proxySpeed)
+
+	workers := c.Int("workers")
+	if workers == 0 {
+		workers = calculateWorkers(proxySpeed, c.Float64("size"))
+		fmt.Printf("🔧 Авто-расчёт: %d воркеров (видео ~%.1f МБ)\n", workers, c.Float64("size"))
+	} else {
+		fmt.Printf("⚙️ Ручной режим: %d воркеров\n", workers)
+	}
+
+	outDir := c.String("output")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return fmt.Errorf("create output directory: %w", err)
+	}
+
+	urls := make(chan string, workers)
+	go func() {
+		defer close(urls)
+		for _, link := range links {
+			select {
+			case <-ctx.Done():
+				return
+			case urls <- link:
+			}
+		}
+	}()
+
+	bar := progressbar.Default(int64(len(links)))
 
 	var wg sync.WaitGroup
 	var proxyIdx int32 = -1
 
-	safeLog("🚀 СТАРТ: %d воркеров | Прокси: %d", recommendedWorkers, len(proxies))
-	for i := 0; i < recommendedWorkers; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go worker(i, urls, proxies, &proxyIdx, *delay, *outDir, &wg)
+		go worker(ctx, i, urls, proxies, &proxyIdx, c.Duration("delay"), outDir, &wg, bar)
 	}
 
 	wg.Wait()
-	safeLog("🏁 Итог: ✅ %d | ❌ %d", atomic.LoadInt64(&success), atomic.LoadInt64(&failed))
+	fmt.Printf("\n🏁 Итог: ✅ %d | ❌ %d\n", atomic.LoadInt64(&success), atomic.LoadInt64(&failed))
+	if ctx.Err() != nil {
+		fmt.Println("⏹️ Завершено по сигналу пользователя")
+	}
+	return nil
+}
+
+func updateYTDLP(_ *cli.Context) error {
+	cmd := exec.Command("yt-dlp", "-U")
+	configureCommand(cmd)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func main() {
+	app := &cli.App{
+		Name:  "download-tiktok",
+		Usage: "Многопоточная CLI-утилита для скачивания видео через yt-dlp",
+		Commands: []*cli.Command{
+			{
+				Name:   "update",
+				Usage:  "обновить yt-dlp через yt-dlp -U",
+				Action: updateYTDLP,
+			},
+		},
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  "links",
+				Value: "links.txt",
+				Usage: "путь к файлу со ссылками",
+			},
+			&cli.StringFlag{
+				Name:  "proxies",
+				Value: "proxies.txt",
+				Usage: "путь к файлу с прокси",
+			},
+			&cli.StringFlag{
+				Name:  "output",
+				Value: "./downloads",
+				Usage: "директория для сохранения видео",
+			},
+			&cli.IntFlag{
+				Name:  "workers",
+				Value: 0,
+				Usage: "количество потоков (0 = автоопределение)",
+			},
+			&cli.Float64Flag{
+				Name:  "size",
+				Value: 15.0,
+				Usage: "примерный размер видео в МБ для авторасчёта воркеров",
+			},
+			&cli.DurationFlag{
+				Name:  "delay",
+				Value: 500 * time.Millisecond,
+				Usage: "минимальная задержка между задачами одного воркера",
+			},
+		},
+		Action: runDownloader,
+	}
+
+	if err := app.Run(os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(1)
+	}
 }
